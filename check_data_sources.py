@@ -123,10 +123,20 @@ def check_fred_series(series_id: str, label: str) -> dict[str, object]:
         }
     )
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?{params}"
-    raw = fetch_bytes(url)
-    csv_text = raw.decode("utf-8-sig")
     out_path = RAW_DIR / "fred" / f"{series_id}.csv"
-    write_text(out_path, csv_text)
+    cache_used = False
+    fetch_error = None
+
+    try:
+        raw = fetch_bytes(url)
+        csv_text = raw.decode("utf-8-sig")
+        write_text(out_path, csv_text)
+    except Exception as exc:
+        if not out_path.exists():
+            raise
+        cache_used = True
+        fetch_error = repr(exc)
+        csv_text = out_path.read_text(encoding="utf-8-sig")
 
     reader = csv.DictReader(csv_text.splitlines())
     rows = list(reader)
@@ -138,6 +148,8 @@ def check_fred_series(series_id: str, label: str) -> dict[str, object]:
             "label": label,
             "raw_file": str(out_path),
             "url": url,
+            "cache_used": cache_used,
+            "fetch_error": fetch_error,
         }
     )
     return summary
@@ -161,17 +173,42 @@ def check_yahoo_ticker(ticker: str, label: str) -> dict[str, object]:
         }
     )
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?{params}"
-    raw = fetch_bytes(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0 Safari/537.36"
-            )
-        },
-    )
-    payload = json.loads(raw.decode("utf-8"))
+    out_path = RAW_DIR / "yahoo" / f"{ticker}.csv"
+    cache_used = False
+    fetch_error = None
+
+    try:
+        raw = fetch_bytes(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"
+                )
+            },
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        if not out_path.exists():
+            raise
+        cache_used = True
+        fetch_error = repr(exc)
+        csv_text = out_path.read_text(encoding="utf-8")
+        rows = list(csv.DictReader(csv_text.splitlines()))
+        summary = summarize_csv_rows(rows, "Date", "Close")
+        summary.update(
+            {
+                "source": "Yahoo chart",
+                "id": ticker,
+                "label": label,
+                "raw_file": str(out_path),
+                "url": url,
+                "cache_used": cache_used,
+                "fetch_error": fetch_error,
+            }
+        )
+        return summary
 
     result = payload.get("chart", {}).get("result") or []
     if not result:
@@ -198,7 +235,6 @@ def check_yahoo_ticker(ticker: str, label: str) -> dict[str, object]:
         if any(row[name.title()] for name in fields if name != "volume") or row["Volume"]:
             rows.append(row)
 
-    out_path = RAW_DIR / "yahoo" / f"{ticker}.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
@@ -216,6 +252,8 @@ def check_yahoo_ticker(ticker: str, label: str) -> dict[str, object]:
             "label": label,
             "raw_file": str(out_path),
             "url": url,
+            "cache_used": cache_used,
+            "fetch_error": fetch_error,
         }
     )
     return summary
@@ -245,7 +283,12 @@ def build_markdown(report: dict[str, object]) -> str:
     ]
 
     for item in report["results"]:
-        status = "OK" if item.get("ok") else "FAIL"
+        if item.get("ok") and item.get("cache_used"):
+            status = "CACHED"
+        elif item.get("ok"):
+            status = "OK"
+        else:
+            status = "FAIL"
         latest_value = item.get("latest_value")
         lines.append(
             "| {source} | {id} | {label} | {status} | {rows} | {first} | {latest} | {value} |".format(
@@ -265,6 +308,15 @@ def build_markdown(report: dict[str, object]) -> str:
         lines.extend(["", "## Failures", ""])
         for item in failures:
             lines.append(f"- {item.get('source')} {item.get('id')}: {item.get('error')}")
+
+    cached = [item for item in report["results"] if item.get("ok") and item.get("cache_used")]
+    if cached:
+        lines.extend(["", "## Cached Sources", ""])
+        for item in cached:
+            lines.append(
+                f"- {item.get('source')} {item.get('id')}: reused {item.get('raw_file')} "
+                f"because the refresh failed with {item.get('fetch_error')}"
+            )
 
     return "\n".join(lines) + "\n"
 
